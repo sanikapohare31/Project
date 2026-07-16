@@ -1,1 +1,317 @@
-. 
+# Day 1 Build Guide — Copilot Prompt Sequence
+
+**Scope:** Project skeleton → Config Server → Eureka Server → API Gateway → Authentication Service
+**Companion docs:** `Database-Schema-Design.md`, `Online-Food-Delivery-System-Planning-Document.md`
+
+---
+
+> **Note on OpenFeign:** No service built on Day 1 makes an outbound call to another service — Auth Service is a leaf service (only ever called, never calls out), and the Gateway/Eureka/Config Server are infrastructure, not Feign consumers. The OpenFeign conventions (package layout, fallback pattern, timeout config) belong in the Day 2 guide, introduced alongside the first real Feign client (`CustomerServiceClient` calling Auth Service's `/internal/auth/users/{id}`). Day 1's Auth Service still exposes that internal endpoint (Prompt 5.5) so it's ready for Day 2 to consume.
+
+## 1. Project Skeleton
+
+### Prompt 1.1 — Parent project
+
+```
+Create a multi-module Maven project named "food-delivery-system" for a Spring Boot
+microservices application using Java 21 and Spring Boot 3.2.x.
+
+Generate a parent pom.xml (packaging: pom) that:
+- Declares Spring Boot 3.2.x and Spring Cloud 2023.0.x BOMs via dependencyManagement
+- Sets java.version to 21
+- Declares these modules (empty folders for now): eureka-server, config-server,
+  api-gateway, auth-service, customer-service, restaurant-service, menu-service,
+  order-service, delivery-service, notification-service, review-rating-service,
+  admin-service
+- Includes common dependency versions for: lombok, spring-boot-starter-test,
+  springdoc-openapi-starter-webmvc-ui
+
+Do not generate application code yet — just the parent pom and empty module folders
+with placeholder pom.xml files inheriting from the parent.
+```
+
+---
+
+## 2. Config Server
+
+### Prompt 2.1 — Config Server module
+
+```
+Inside the config-server module of a Spring Cloud multi-module Maven project
+(Java 21, Spring Boot 3.2.x, Spring Cloud 2023.0.x), generate:
+
+1. pom.xml with spring-cloud-config-server dependency
+2. ConfigServerApplication.java with @EnableConfigServer
+3. application.yml configured to:
+   - run on port 8888
+   - serve configuration from a native/classpath location at
+     classpath:/config-repo (not a Git repo, to keep local setup simple)
+   - register itself with Eureka at http://localhost:8761/eureka
+
+Also generate a config-repo folder under src/main/resources with placeholder
+application.yml files for each of these services: auth-service, customer-service,
+restaurant-service, menu-service, order-service, delivery-service,
+notification-service, review-rating-service, admin-service.
+Each placeholder file should just contain that service's spring.datasource.url,
+username, and password for a local PostgreSQL database named
+<service>_service_db (e.g. auth_service_db), plus server.port matching this table:
+
+auth-service: 8081, customer-service: 8082, restaurant-service: 8083,
+menu-service: 8084, order-service: 8085, delivery-service: 8086,
+notification-service: 8087, review-rating-service: 8088, admin-service: 8089
+```
+
+---
+
+## 3. Eureka Server
+
+### Prompt 3.1 — Eureka Server module
+
+```
+Inside the eureka-server module of the same Spring Cloud multi-module project,
+generate:
+
+1. pom.xml with spring-cloud-starter-netflix-eureka-server dependency
+2. EurekaServerApplication.java with @EnableEurekaServer
+3. application.yml configured to:
+   - run on port 8761
+   - disable self-registration and self-fetching of the registry
+     (register-with-eureka: false, fetch-registry: false), since this is the
+     registry itself
+   - set a simple application name "eureka-server"
+
+Keep this minimal — no custom dashboard changes, use Eureka's default UI.
+```
+
+---
+
+## 4. API Gateway
+
+### Prompt 4.1 — Gateway module + routing
+
+```
+Inside the api-gateway module of the same project, generate:
+
+1. pom.xml with spring-cloud-starter-gateway, spring-cloud-starter-netflix-eureka-client,
+   and spring-boot-starter-security dependencies
+2. ApiGatewayApplication.java
+3. application.yml configured to:
+   - run on port 8080
+   - register with Eureka at http://localhost:8761/eureka
+   - pull shared config from Config Server at http://localhost:8888
+   - enable Spring Cloud Gateway's service-discovery-based routing
+     (spring.cloud.gateway.discovery.locator.enabled: true)
+   - define explicit routes (do NOT rely only on auto-discovery) for these
+     public path prefixes, each routing by lb://<eureka-service-name>:
+     /api/auth/**        -> lb://auth-service
+     /api/customers/**   -> lb://customer-service
+     /api/restaurants/** -> lb://restaurant-service
+     /api/items/**       -> lb://menu-service
+     /api/cart/**        -> lb://order-service
+     /api/orders/**      -> lb://order-service
+     /api/deliveries/**  -> lb://delivery-service
+     /api/delivery-agents/** -> lb://delivery-service
+     /api/notifications/** -> lb://notification-service
+     /api/reviews/**     -> lb://review-rating-service
+     /api/admin/**       -> lb://admin-service
+
+   Do NOT add a route for any /internal/** path — those must never be reachable
+   through the gateway, only via direct service-to-service Feign calls.
+
+Do not implement JWT validation yet — that comes in the next prompt.
+```
+
+### Prompt 4.2 — JWT validation filter at the gateway
+
+```
+In the api-gateway module, add a global Spring Cloud Gateway filter
+(GlobalFilter + Ordered) named JwtAuthenticationFilter that:
+
+- Skips validation entirely for requests to /api/auth/register and
+  /api/auth/login (these must remain public)
+- For every other request, reads the "Authorization: Bearer <token>" header
+- Validates the JWT signature and expiry using a shared secret (read from
+  application.yml as jwt.secret) — use the jjwt library (io.jsonwebtoken)
+- If the token is missing or invalid, short-circuits the request and returns
+  HTTP 401 with a JSON body {"error": "Unauthorized"}
+- If valid, forwards the request unchanged (role-based authorization happens
+  in each downstream service, not here)
+
+Add io.jsonwebtoken:jjwt-api, jjwt-impl, jjwt-jackson as dependencies
+(version 0.12.x) in the api-gateway pom.xml.
+Add a placeholder jwt.secret value in application.yml with a comment that
+it must match the same secret configured in auth-service.
+```
+
+---
+
+## 5. Authentication Service
+
+Reference the exact schema from `Database-Schema-Design.md` Section 3 (`roles`, `users` tables) in every prompt below — do not let Copilot invent extra columns.
+
+### Prompt 5.1 — Entities
+
+```
+In the auth-service module (Java 21, Spring Boot 3.2.x, Spring Data JPA, Lombok),
+generate JPA entities for exactly these two tables. Do not add any fields beyond
+what's listed.
+
+Table: roles
+- id: SERIAL PK
+- name: VARCHAR(30) NOT NULL UNIQUE  (values: CUSTOMER, RESTAURANT_OWNER,
+  DELIVERY_PARTNER, ADMIN)
+
+Table: users
+- id: BIGSERIAL PK
+- email: VARCHAR(150) NOT NULL UNIQUE
+- phone: VARCHAR(15) NOT NULL UNIQUE
+- password_hash: VARCHAR(255) NOT NULL
+- role_id: INT NOT NULL, FK to roles.id
+- is_active: BOOLEAN NOT NULL DEFAULT TRUE
+- is_verified: BOOLEAN NOT NULL DEFAULT FALSE
+- created_at: TIMESTAMP NOT NULL, auto-set on insert
+- updated_at: TIMESTAMP NOT NULL, auto-updated on every update
+
+Use package com.fooddelivery.authservice.entity.
+Use @ManyToOne for the users -> roles relationship.
+Use Hibernate's @CreationTimestamp / @UpdateTimestamp for created_at/updated_at
+instead of a manual trigger, since this is a JPA-managed entity.
+```
+
+### Prompt 5.2 — Repositories, DTOs, mapper
+
+```
+In auth-service, generate:
+1. RoleRepository and UserRepository (Spring Data JPA), with a
+   UserRepository.findByEmail(String email) and findByPhone(String phone)
+   method in addition to the standard CRUD methods.
+2. DTOs in com.fooddelivery.authservice.dto:
+   - RegisterRequest (email, phone, password, role — validate email format,
+     phone pattern, password min length 8, role must be one of the 4 valid
+     role names, using Bean Validation annotations)
+   - LoginRequest (email, password)
+   - AuthResponse (accessToken, tokenType default "Bearer", expiresInSeconds,
+     userId, role)
+3. A simple UserMapper (plain class, not MapStruct) converting User entity
+   to a minimal UserSummary DTO (id, email, role) for internal use.
+
+Do not add a refresh token DTO or entity — this service issues a single
+stateless JWT access token only, no refresh-token flow.
+```
+
+### Prompt 5.3 — JWT utility
+
+```
+In auth-service, create a JwtUtil component (com.fooddelivery.authservice.security)
+that:
+- Generates a signed JWT (io.jsonwebtoken / jjwt 0.12.x) containing claims:
+  sub (user id), email, role, iat, exp
+- Sets expiry to 24 hours from issuance (configurable via
+  jwt.expiration-ms in application.yml, default 86400000)
+- Uses a shared secret from jwt.secret in application.yml (must match the
+  same value configured in api-gateway)
+- Exposes: generateToken(User user), extractUserId(String token),
+  extractRole(String token), isTokenValid(String token)
+
+Add jjwt-api, jjwt-impl, jjwt-jackson (0.12.x) to auth-service's pom.xml.
+```
+
+### Prompt 5.4 — Service layer
+
+```
+In auth-service, generate an AuthService (com.fooddelivery.authservice.service)
+with:
+- register(RegisterRequest request): validates email/phone aren't already
+  taken (throw a custom DuplicateResourceException if so), hashes the
+  password with BCrypt (BCryptPasswordEncoder), looks up the role_id by
+  role name, saves the new user, returns a UserSummary
+- login(LoginRequest request): finds the user by email, verifies the
+  password with BCrypt, throws a custom InvalidCredentialsException if
+  the user doesn't exist or password doesn't match, throws a custom
+  AccountDisabledException if is_active is false, otherwise generates
+  a JWT via JwtUtil and returns an AuthResponse
+
+Do not implement any refresh/logout logic — there is no refresh token to
+revoke in this design.
+```
+
+### Prompt 5.5 — Controller + internal endpoint
+
+```
+In auth-service, generate an AuthController exposing:
+- POST /api/auth/register -> calls AuthService.register, returns 201
+- POST /api/auth/login -> calls AuthService.login, returns 200 with AuthResponse
+
+Also generate a separate InternalUserController exposing:
+- GET /internal/auth/users/{id} -> returns a UserSummary (id, email, role)
+  for other services to validate a user_id via Feign. This endpoint is not
+  routed through the API Gateway and is intended for service-to-service calls
+  only.
+
+Both controllers go in com.fooddelivery.authservice.controller.
+Use @Valid on request bodies and return ResponseEntity<T>.
+```
+
+### Prompt 5.6 — Global exception handling
+
+```
+In auth-service, generate a GlobalExceptionHandler (@RestControllerAdvice) in
+com.fooddelivery.authservice.exception that handles:
+- DuplicateResourceException -> 409 Conflict
+- InvalidCredentialsException -> 401 Unauthorized
+- AccountDisabledException -> 403 Forbidden
+- MethodArgumentNotValidException (Bean Validation failures) -> 400 Bad Request
+  with a map of field -> error message
+- Exception (catch-all) -> 500 Internal Server Error
+
+Return a consistent JSON error shape for every case:
+{ "timestamp": "...", "status": 401, "error": "Invalid Credentials",
+  "message": "..." }
+
+This exact response shape and handler structure will be reused as the template
+for every other service's exception handler — keep it generic enough to copy.
+```
+
+### Prompt 5.7 — application.yml + Swagger
+
+```
+In auth-service, generate application.yml that:
+- Sets spring.application.name to "auth-service"
+- Pulls config from Config Server (http://localhost:8888) and registers with
+  Eureka (http://localhost:8761/eureka)
+- Runs on port 8081
+- Configures spring.datasource for PostgreSQL database auth_service_db
+- Sets spring.jpa.hibernate.ddl-auto to "validate" (schema is created via the
+  SQL script, not Hibernate auto-generation)
+- Adds jwt.secret and jwt.expiration-ms placeholders
+
+Also add springdoc-openapi-starter-webmvc-ui to pom.xml and confirm
+Swagger UI will be available at /swagger-ui.html with zero extra config
+beyond the dependency.
+```
+
+### Prompt 5.8 — Unit tests
+
+```
+In auth-service, generate JUnit 5 + Mockito unit tests for AuthService covering:
+- register() succeeds with a new email/phone
+- register() throws DuplicateResourceException when email already exists
+- login() succeeds with correct credentials and returns a non-null token
+- login() throws InvalidCredentialsException with wrong password
+- login() throws AccountDisabledException when is_active is false
+
+Mock UserRepository, RoleRepository, PasswordEncoder, and JwtUtil —
+do not hit a real database or generate a real JWT in these tests.
+```
+
+---
+
+## Checklist before moving to Day 2
+
+- [ ] `docker-compose up` (or local Postgres) has 9 databases created, one per service naming convention (`auth_service_db`, etc.)
+- [ ] Config Server starts and serves `/auth-service/default` successfully
+- [ ] Eureka dashboard shows `config-server` registered (once it points at Eureka)
+- [ ] API Gateway starts, registers with Eureka, and rejects an unauthenticated request to a protected route with 401
+- [ ] Auth Service starts, registers with Eureka, and you can `POST /api/auth/register` + `POST /api/auth/login` through the Gateway and get a real JWT back
+- [ ] `GET /internal/auth/users/{id}` works when called directly (not through the Gateway) — this is what Customer Service will Feign-call on Day 2
+
+Once this checklist passes, Day 2 (Customer, Restaurant, Menu Services) will introduce the first real Feign client — `CustomerServiceClient` calling `GET /internal/auth/users/{id}` to validate a `user_id` at registration. The Day 2 guide will open with the OpenFeign conventions (package layout, fallback pattern, timeout config) that every subsequent service's Feign client should follow.

@@ -1,0 +1,397 @@
+Day 5 Build Guide — Notification Service → Delivery Service
+
+Scope: Notification Service (build first — no dependencies) → Delivery Service (depends on Order Service and Notification Service).
+Design decision made before writing these prompts: Delivery Service owns the responsibility of keeping orders.order_status in sync with deliveries.delivery_status, via a Feign call back into Order Service. The client only ever talks to Delivery Service to update delivery progress — it never has to call both APIs itself.
+Companion docs: Database-Schema-Design.md Sections 8–9, Day3-4-Copilot-Prompt-Sequence.md
+
+
+
+0. Prerequisite — one small addition to Order Service
+
+Prompt 0.1 — Internal status-update endpoint
+
+In the existing order-service module, add one more endpoint to
+InternalOrderController:
+
+PUT /internal/orders/{id}/status
+-> accepts the same UpdateOrderStatusRequest DTO already used by the
+   public PUT /api/orders/{id}/status endpoint, reuses the existing
+   OrderService.updateOrderStatus() method (same transition validation
+   rules — no backwards moves, CANCELLED allowed except from DELIVERED),
+   and returns the updated OrderResponse
+
+This endpoint is for Delivery Service to call via Feign when a delivery's
+status changes — it is not routed through the API Gateway. Do not change
+any other existing files in order-service.
+
+
+PART A — Notification Service (build first)
+
+Reference Database-Schema-Design.md Section 9 (notifications — single table, append-only).
+
+
+Prompt A.1 — Entity
+
+In the notification-service module (Java 21, Spring Boot 3.2.x, Spring
+Data JPA, Lombok), generate a JPA entity for exactly this table. Do not
+add any fields beyond what's listed.
+
+Table: notifications
+- id: BIGSERIAL PK
+- user_id: BIGINT NOT NULL (logical reference to Auth Service users.id)
+- notification_type: VARCHAR(40) NOT NULL (values: ORDER_CONFIRMATION,
+  PAYMENT_STATUS, DELIVERY_STATUS, RESTAURANT_APPROVAL,
+  DELIVERY_PARTNER_APPROVAL)
+- channel: VARCHAR(20) NOT NULL DEFAULT 'PUSH' (values: EMAIL, SMS, PUSH)
+- title: VARCHAR(150) NOT NULL
+- message: TEXT NOT NULL
+- status: VARCHAR(20) NOT NULL DEFAULT 'PENDING' (values: PENDING, SENT, FAILED)
+- sent_at: TIMESTAMP, nullable
+- created_at: TIMESTAMP NOT NULL, auto-set on insert
+
+Use package com.fooddelivery.notificationservice.entity.
+Use @CreationTimestamp for created_at. This entity has no updated_at —
+notifications are immutable after creation except for status/sent_at,
+which are set once on dispatch.
+
+Prompt A.2 — Repository and DTOs
+
+In notification-service, generate:
+1. NotificationRepository (Spring Data JPA) with
+   findByUserIdOrderByCreatedAtDesc(Long userId)
+2. DTOs in com.fooddelivery.notificationservice.dto:
+   - SendNotificationRequest (userId, notificationType, channel, title,
+     message — Bean Validation: notificationType must be one of the 5
+     valid values, channel must be one of the 3 valid values, title and
+     message not blank)
+   - NotificationResponse (id, userId, notificationType, channel, title,
+     message, status, sentAt, createdAt)
+
+Prompt A.3 — Service layer
+
+In notification-service, generate a NotificationService
+(com.fooddelivery.notificationservice.service) with:
+
+- send(SendNotificationRequest request): creates a notifications row
+  with status = PENDING, then immediately simulates dispatch — log the
+  notification via SLF4J (info level: "Sending {channel} notification to
+  user {userId}: {title}"), set status = SENT and sent_at = now, save,
+  and return the NotificationResponse.
+
+  Add a clear Javadoc comment stating this simulates delivery — there is
+  no real email/SMS/push provider integration in this project's scope.
+
+- getNotificationsForUser(Long userId): returns
+  List<NotificationResponse> ordered by most recent first
+
+Prompt A.4 — Controllers
+
+In notification-service, generate two controllers:
+
+1. NotificationController (public API), package
+   com.fooddelivery.notificationservice.controller:
+   GET /api/notifications/me -> getNotificationsForUser (userId from an
+   X-User-Id header, same convention as other services)
+
+2. InternalNotificationController:
+   POST /internal/notifications -> send, for other services' Feign
+   clients to trigger a notification. Not routed through the API
+   Gateway.
+
+Use @Valid on request bodies, ResponseEntity<T>.
+
+Prompt A.5 — Global exception handling
+
+In notification-service, generate a GlobalExceptionHandler
+(@RestControllerAdvice) in com.fooddelivery.notificationservice.exception,
+using the same response shape as auth-service's handler (paste it as
+reference), handling:
+- MethodArgumentNotValidException -> 400 with field error map
+- Exception (catch-all) -> 500
+
+Prompt A.6 — application.yml + Swagger
+
+In notification-service, generate application.yml that:
+- Sets spring.application.name to "notification-service"
+- Pulls config from Config Server, registers with Eureka
+- Runs on port 8087
+- Configures PostgreSQL datasource for notification_service_db
+- Sets spring.jpa.hibernate.ddl-auto to "validate"
+
+Add springdoc-openapi-starter-webmvc-ui to pom.xml.
+
+Prompt A.7 — Unit tests
+
+In notification-service, generate JUnit 5 + Mockito tests for
+NotificationService:
+- send() saves a notification with status transitioning from PENDING to
+  SENT, and a non-null sentAt
+- getNotificationsForUser() returns results ordered most-recent-first
+
+Mock NotificationRepository.
+
+
+PART B — Delivery Service
+
+Reference Database-Schema-Design.md Section 8 (delivery_partners, deliveries). Depends on Order Service (Prompt 0.1) and Notification Service (Part A) — build this after both are working.
+
+
+Prompt B.1 — Entities
+
+In the delivery-service module, generate JPA entities for exactly these
+two tables. Do not add any fields beyond what's listed.
+
+Table: delivery_partners
+- id: BIGSERIAL PK
+- user_id: BIGINT NOT NULL UNIQUE (logical reference to Auth Service
+  users.id)
+- full_name: VARCHAR(100) NOT NULL
+- phone: VARCHAR(15) NOT NULL
+- vehicle_type: VARCHAR(30), nullable (e.g. BIKE, SCOOTER, BICYCLE)
+- vehicle_number: VARCHAR(20), nullable
+- approval_status: VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+  (values: PENDING, APPROVED, REJECTED)
+- availability_status: VARCHAR(20) NOT NULL DEFAULT 'OFFLINE'
+  (values: AVAILABLE, BUSY, OFFLINE)
+- current_latitude: NUMERIC(9,6), nullable
+- current_longitude: NUMERIC(9,6), nullable
+- created_at: TIMESTAMP NOT NULL, auto-set on insert
+- updated_at: TIMESTAMP NOT NULL, auto-updated on every update
+
+Table: deliveries
+- id: BIGSERIAL PK
+- order_id: BIGINT NOT NULL UNIQUE (logical reference to Order Service
+  orders.id — one delivery per order)
+- delivery_partner_id: BIGINT NOT NULL, FK to delivery_partners.id
+- delivery_status: VARCHAR(20) NOT NULL DEFAULT 'ASSIGNED'
+  (values: ASSIGNED, PICKED_UP, DELIVERED, CANCELLED)
+- assigned_at: TIMESTAMP NOT NULL, auto-set on insert
+- picked_up_at: TIMESTAMP, nullable
+- delivered_at: TIMESTAMP, nullable
+
+Use package com.fooddelivery.deliveryservice.entity.
+Use @ManyToOne (deliveries -> delivery_partners).
+Use @CreationTimestamp / @UpdateTimestamp where applicable.
+
+Prompt B.2 — Repositories and DTOs
+
+In delivery-service, generate:
+1. DeliveryPartnerRepository with findByUserId(Long userId) and
+   findFirstByAvailabilityStatusAndApprovalStatus(String availabilityStatus,
+   String approvalStatus)
+2. DeliveryRepository with findByOrderId(Long orderId) and
+   findByDeliveryPartnerId(Long partnerId)
+3. DTOs in com.fooddelivery.deliveryservice.dto:
+   - RegisterDeliveryPartnerRequest (userId, fullName, phone, vehicleType,
+     vehicleNumber — Bean Validation on fullName/phone not blank)
+   - DeliveryPartnerResponse (all columns)
+   - UpdateAvailabilityRequest (availabilityStatus — must be AVAILABLE,
+     BUSY, or OFFLINE)
+   - UpdateLocationRequest (latitude, longitude)
+   - UpdateApprovalStatusRequest (approvalStatus — must be APPROVED or
+     REJECTED)
+   - CreateDeliveryRequest (orderId)
+   - DeliveryResponse (id, orderId, deliveryPartnerId, deliveryStatus,
+     assignedAt, pickedUpAt, deliveredAt)
+   - UpdateDeliveryStatusRequest (deliveryStatus)
+4. A plain DeliveryMapper class (manual mapping, no MapStruct).
+
+Prompt B.3 — Feign clients
+
+In delivery-service, generate three OpenFeign clients following the
+convention from previous services (package
+com.fooddelivery.deliveryservice.client, one subfolder per client):
+
+1. AuthServiceClient (@FeignClient(name = "auth-service",
+   fallback = AuthServiceFallback.class)):
+   GET /internal/auth/users/{id} -> UserSummaryResponse (id, email, role)
+
+2. OrderServiceClient (@FeignClient(name = "order-service",
+   fallback = OrderServiceFallback.class)):
+   GET /internal/orders/{id} -> OrderSummaryResponse (id, customerId,
+   restaurantId, orderStatus)
+   PUT /internal/orders/{id}/status -> OrderSummaryResponse (body:
+   { "orderStatus": "..." })
+
+3. NotificationServiceClient (@FeignClient(name = "notification-service",
+   fallback = NotificationServiceFallback.class)):
+   POST /internal/notifications -> NotificationSummaryResponse (body:
+   { "userId": ..., "notificationType": "DELIVERY_STATUS", "channel":
+   "PUSH", "title": "...", "message": "..." })
+
+Each fallback throws ServiceUnavailableException naming the unreachable
+service, EXCEPT NotificationServiceFallback, which instead logs a warning
+and returns null — a failed notification should never block a delivery
+status update. Add spring-cloud-starter-openfeign to pom.xml and
+@EnableFeignClients to the main application class, plus the shared Feign
+timeout block in application.yml.
+
+Prompt B.4 — DeliveryPartnerService
+
+In delivery-service, generate a DeliveryPartnerService
+(com.fooddelivery.deliveryservice.service) with:
+
+- registerPartner(RegisterDeliveryPartnerRequest request): calls
+  AuthServiceClient.getUser(request.getUserId()) to confirm the user
+  exists with role DELIVERY_PARTNER (throw InvalidUserRoleException if
+  not); throws DuplicateResourceException if a partner profile already
+  exists for that user_id; saves with approval_status = PENDING,
+  availability_status = OFFLINE
+
+- updateApprovalStatus(Long partnerId, UpdateApprovalStatusRequest request):
+  admin-only
+
+- updateAvailability(Long partnerId, UpdateAvailabilityRequest request):
+  throws InvalidUserRoleException-style validation isn't needed here,
+  just updates the status; reject the change with a custom
+  PartnerNotApprovedException if approval_status isn't APPROVED
+
+- updateLocation(Long partnerId, UpdateLocationRequest request)
+
+- findAvailablePartner(): returns the first partner with
+  availability_status = AVAILABLE and approval_status = APPROVED, or
+  throws NoPartnerAvailableException if none exist. Note in a comment
+  that this is a simple "first available" strategy — no geo-distance
+  matching in this project's scope.
+
+- markPartnerBusy(Long partnerId) / markPartnerAvailable(Long partnerId):
+  small helper methods used by DeliveryService during assignment and
+  completion
+
+Prompt B.5 — DeliveryService
+
+In delivery-service, generate a DeliveryService
+(com.fooddelivery.deliveryservice.service) with:
+
+- createDelivery(CreateDeliveryRequest request):
+  1. throws DuplicateResourceException if a delivery already exists for
+     that order_id
+  2. calls OrderServiceClient.getOrder(request.getOrderId()); throws
+     ResourceNotFoundException if missing, throws
+     InvalidOrderStateException if orderStatus is DELIVERED or CANCELLED
+  3. calls DeliveryPartnerService.findAvailablePartner()
+  4. creates the Delivery row (delivery_status = ASSIGNED, assigned_at =
+     now), and calls DeliveryPartnerService.markPartnerBusy(partnerId)
+  5. attempts NotificationServiceClient.send(...) with
+     notificationType = DELIVERY_STATUS to the order's customer_id —
+     wrap this call in a try/catch that only logs a warning on failure,
+     never throws
+  6. returns the DeliveryResponse
+
+- updateDeliveryStatus(Long deliveryId, UpdateDeliveryStatusRequest request):
+  1. validates the transition only moves forward:
+     ASSIGNED -> PICKED_UP -> DELIVERED, with CANCELLED allowed from
+     ASSIGNED or PICKED_UP only (not from DELIVERED); throw
+     InvalidDeliveryStatusTransitionException otherwise
+  2. sets picked_up_at when moving to PICKED_UP, delivered_at when
+     moving to DELIVERED
+  3. calls OrderServiceClient.updateOrderStatus(orderId, ...) mapping
+     PICKED_UP -> PICKED_UP, DELIVERED -> DELIVERED, CANCELLED ->
+     CANCELLED, so Order Service's order_status stays in sync
+  4. if the new status is DELIVERED or CANCELLED, calls
+     DeliveryPartnerService.markPartnerAvailable(partnerId)
+  5. attempts a best-effort NotificationServiceClient call (same
+     try/catch pattern as createDelivery)
+  6. returns the updated DeliveryResponse
+
+- getDeliveryById(Long id): throws ResourceNotFoundException if missing
+
+- getDeliveryByOrderId(Long orderId): for internal Feign consumption by
+  Review Service on Day 6 (to look up which partner delivered an order)
+
+Prompt B.6 — Controllers
+
+In delivery-service, generate three controllers:
+
+1. DeliveryPartnerController (public API), package
+   com.fooddelivery.deliveryservice.controller:
+   POST /api/delivery-partners                -> registerPartner
+   PUT  /api/delivery-partners/me/availability -> updateAvailability
+   PUT  /api/delivery-partners/me/location     -> updateLocation
+   PUT  /api/delivery-partners/{id}/approval   -> updateApprovalStatus (admin)
+
+2. DeliveryController (public API):
+   POST /api/deliveries         -> createDelivery
+   GET  /api/deliveries/{id}    -> getDeliveryById
+   PUT  /api/deliveries/{id}/status -> updateDeliveryStatus (partner-only)
+
+3. InternalDeliveryController:
+   GET /internal/deliveries/by-order/{orderId} -> getDeliveryByOrderId,
+   for Review Service's Feign client on Day 6
+
+Use @Valid on request bodies, ResponseEntity<T>.
+
+Prompt B.7 — Global exception handling
+
+In delivery-service, generate a GlobalExceptionHandler
+(@RestControllerAdvice) in com.fooddelivery.deliveryservice.exception,
+using the same response shape as auth-service's handler (paste it as
+reference), handling:
+- ResourceNotFoundException -> 404
+- DuplicateResourceException -> 409
+- InvalidUserRoleException -> 400
+- InvalidOrderStateException -> 400
+- NoPartnerAvailableException -> 409
+- PartnerNotApprovedException -> 400
+- InvalidDeliveryStatusTransitionException -> 409
+- ServiceUnavailableException -> 503
+- MethodArgumentNotValidException -> 400 with field error map
+- Exception (catch-all) -> 500
+
+Prompt B.8 — application.yml + Swagger
+
+In delivery-service, generate application.yml that:
+- Sets spring.application.name to "delivery-service"
+- Pulls config from Config Server, registers with Eureka
+- Runs on port 8086
+- Configures PostgreSQL datasource for delivery_service_db
+- Sets spring.jpa.hibernate.ddl-auto to "validate"
+- Includes the shared Feign timeout block
+
+Add springdoc-openapi-starter-webmvc-ui to pom.xml.
+
+Prompt B.9 — Unit tests
+
+In delivery-service, generate JUnit 5 + Mockito tests:
+
+DeliveryPartnerService:
+- registerPartner() throws InvalidUserRoleException for the wrong role
+- findAvailablePartner() throws NoPartnerAvailableException when none
+  are AVAILABLE and APPROVED
+
+DeliveryService:
+- createDelivery() throws DuplicateResourceException when a delivery
+  already exists for the order
+- createDelivery() throws InvalidOrderStateException when the order is
+  already DELIVERED or CANCELLED
+- createDelivery() marks the assigned partner as BUSY
+- createDelivery() still succeeds and returns a result even when
+  NotificationServiceClient throws (best-effort notification)
+- updateDeliveryStatus() throws InvalidDeliveryStatusTransitionException
+  for a backwards move
+- updateDeliveryStatus() calls OrderServiceClient.updateOrderStatus()
+  with the correctly mapped status
+- updateDeliveryStatus() marks the partner AVAILABLE again once
+  DELIVERED
+
+Mock all repositories and all three Feign clients.
+
+
+Checklist before moving to Day 6 (Review & Rating, Admin)
+
+
+ POST /internal/notifications works directly and returns a SENT notification
+
+ Registering a delivery partner with the wrong role (e.g. a CUSTOMER user_id) is rejected
+
+ POST /api/deliveries fails with NoPartnerAvailableException when no partner is AVAILABLE + APPROVED, and succeeds once one is
+
+ Moving a delivery to PICKED_UP then DELIVERED correctly moves orders.order_status in step, verified by checking Order Service directly
+
+ Killing Notification Service and creating a delivery still succeeds (best-effort notification, not a hard dependency)
+
+ GET /internal/deliveries/by-order/{orderId} works directly — Review Service will use this on Day 6 to confirm which partner handled a completed order
+
+
+Day 6 (Review & Rating Service, Admin Service) will be the last two services — Review Service Feign-calls Order Service (to confirm DELIVERED status) and this new Delivery endpoint; Admin Service mostly orchestrates calls into Restaurant/Delivery/Auth Service rather than owning much data itself.
+

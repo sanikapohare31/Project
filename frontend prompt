@@ -1,0 +1,601 @@
+Frontend Build Guide — Thymeleaf Web Service (No JavaScript)
+
+Scope: A new, separate web-frontend Spring Boot module — server-rendered Thymeleaf pages for all 4 roles (Customer, Restaurant Owner, Delivery Partner, Admin), talking to the backend exclusively through the API Gateway, with zero JavaScript anywhere in the templates.
+Realistic timeline: ~2–3 additional days for one developer, even with Copilot generating most of the boilerplate — this is a full role-based UI across ~25+ pages, not a thin demo wrapper. Treat it as its own phase after the 9 backend services are working, not a "Day 7 afternoon" task.
+Companion docs: all previous DayN-Copilot-Prompt-Sequence.md files, Database-Schema-Design.md, Online-Food-Delivery-System-Planning-Document.md
+
+
+Hard constraint to repeat in every prompt below: No JavaScript, no <script> tags, no AJAX/fetch, no JS-dependent CSS framework components (Bootstrap's navbar-toggler, dropdowns, modals — all of those need JS bundle). Every interaction is a classic HTML form (GET/POST) with a full page reload. Copilot will reach for JS out of habit if you don't say this every time.
+
+
+
+0. Discovery — do this before generating any frontend code
+
+Prompt 0.1 — Make Copilot read the real project first
+
+Before writing any frontend code, scan this entire multi-module workspace
+and build an accurate inventory of what actually exists. Specifically:
+
+1. List every @RestController class across all 9 business services and
+   api-gateway, with their full request mappings (method + path).
+2. For each endpoint, note: is it public, or does it require a specific
+   role (check any @PreAuthorize/@Secured annotations or security config
+   you find)?
+3. List every request DTO's fields and validation annotations for the
+   endpoints that accept a request body (register, login, create
+   restaurant, add menu item, checkout, etc.).
+4. List every response DTO's fields for the endpoints that return data.
+5. Note the JWT claim structure produced by auth-service's JwtUtil
+   (which claims it puts in the token: sub, email, role, etc.)
+
+Summarize this as a markdown scratch file (ENDPOINT_INVENTORY.md, not
+part of the final deliverable) so you have accurate ground truth before
+generating a single frontend template or controller. Do not invent any
+endpoint, field, or role restriction that isn't actually present in the
+codebase — if something a screen needs doesn't exist yet, list it under
+a "Missing / Needs backend change" section instead of guessing.
+
+Review that inventory file yourself before continuing — it's your check that Copilot is building against your real project, not a hallucinated one.
+
+
+Prompt 0.2 — Prerequisite: admin pending-approval lists
+
+The Admin pages need to list restaurants/partners awaiting approval — nothing currently exposes that.
+
+
+Add two small admin-only endpoints to the existing backend:
+
+1. In restaurant-service, add GET /api/restaurants/pending to
+   RestaurantController -> calls a new RestaurantService method
+   getPendingRestaurants() (repository query: findByApprovalStatus
+   ("PENDING")) -> returns List<RestaurantResponse>
+
+2. In delivery-service, add GET /api/delivery-partners/pending to
+   DeliveryPartnerController -> calls a new
+   getPendingPartners() method (repository query already exists:
+   adapt findByAvailabilityStatusAndApprovalStatus or add a simpler
+   findByApprovalStatus("PENDING")) -> returns List<DeliveryPartnerResponse>
+
+Both should be restricted to the ADMIN role at the Gateway/security-config
+level, same as the other admin-only endpoints. Do not change any other
+existing files.
+
+
+1. Module Setup
+
+Prompt 1.1 — Project skeleton
+
+Add a new module "web-frontend" to the existing multi-module Maven
+project (Java 21, Spring Boot 3.2.x, Spring Cloud 2023.0.x). Generate:
+
+1. pom.xml with dependencies: spring-boot-starter-thymeleaf,
+   spring-boot-starter-web, spring-boot-starter-security,
+   spring-boot-starter-validation, thymeleaf-extras-springsecurity6,
+   spring-cloud-starter-openfeign, spring-cloud-starter-netflix-eureka-client,
+   lombok
+2. WebFrontendApplication.java with @EnableFeignClients
+3. application.yml:
+   - spring.application.name: web-frontend
+   - server.port: 8090
+   - registers with Eureka at http://localhost:8761/eureka
+   - pulls config from Config Server at http://localhost:8888
+   - the shared Feign timeout block used across the other services
+
+This module renders HTML — it has no database and no JPA dependency.
+This entire module must never use JavaScript. Every page is
+server-rendered Thymeleaf, every interaction is a plain HTML form with a
+full page reload. Do not add any <script> tag or JS library at any point
+in this build.
+
+
+2. Backend Integration Layer
+
+Prompt 2.1 — Feign clients to the API Gateway
+
+In web-frontend, generate OpenFeign clients that call the API Gateway
+(not individual services directly) — package com.fooddelivery.web.client,
+one interface per backend service area, all using
+@FeignClient(name = "api-gateway"):
+
+- AuthApiClient: POST /api/auth/register, POST /api/auth/login
+- CustomerApiClient: POST /api/customers, GET /api/customers/me,
+  PUT /api/customers/me, POST/GET /api/customers/me/addresses,
+  PUT/DELETE /api/customers/me/addresses/{id}
+- RestaurantApiClient: POST /api/restaurants, GET /api/restaurants,
+  GET /api/restaurants/pending, GET /api/restaurants/{id},
+  PUT /api/restaurants/{id}, PUT /api/restaurants/{id}/open-status
+- MenuApiClient: GET /api/restaurants/{restaurantId}/menu,
+  POST /api/restaurants/{restaurantId}/categories,
+  POST /api/restaurants/{restaurantId}/items,
+  PUT /api/items/{itemId}, DELETE /api/items/{itemId}
+- OrderApiClient: POST /api/cart/items, GET /api/cart,
+  PUT /api/cart/items/{id}, DELETE /api/cart/items/{id},
+  POST /api/cart/checkout, GET /api/orders/{id}, GET /api/orders,
+  PUT /api/orders/{id}/status, POST /api/orders/{id}/payment,
+  GET /api/orders/{id}/payments
+- DeliveryApiClient: POST /api/delivery-partners,
+  PUT /api/delivery-partners/me/availability,
+  PUT /api/delivery-partners/me/location, GET /api/deliveries/{id},
+  PUT /api/deliveries/{id}/status
+- ReviewApiClient: POST /api/reviews, GET /api/reviews/restaurant/{id},
+  GET /api/reviews/customer/me
+- NotificationApiClient: GET /api/notifications/me
+- AdminApiClient: PUT /api/admin/restaurants/{id}/approval,
+  PUT /api/admin/delivery-partners/{id}/approval,
+  PUT /api/admin/users/{id}/disable, PUT /api/admin/users/{id}/enable,
+  GET /api/admin/audit-logs, GET/PUT /api/admin/settings/{key}
+
+Reuse the exact request/response DTO shapes documented in
+ENDPOINT_INVENTORY.md for each call — do not invent extra fields.
+Put each client's request/response DTOs in a matching dto subpackage.
+
+Prompt 2.2 — JWT bridging (Feign interceptor)
+
+In web-frontend, generate a FeignAuthInterceptor implementing
+RequestInterceptor (com.fooddelivery.web.config) that:
+
+- Reads the current Authentication from SecurityContextHolder
+- If the principal is an instance of a custom AuthenticatedUser class
+  (created in the next prompt) holding a JWT string, adds header
+  "Authorization: Bearer <token>" to every outgoing Feign request
+- If there's no authenticated user (e.g. the register/login calls
+  themselves), adds no Authorization header
+
+Register this as a @Bean so it applies to every Feign client in this
+module automatically.
+
+Prompt 2.3 — Custom authentication
+
+In web-frontend, generate:
+
+1. AuthenticatedUser (com.fooddelivery.web.security) implementing
+   Spring Security's UserDetails or usable as a custom principal —
+   holds: userId (Long), email, role (String), jwtToken (String)
+
+2. FoodDeliveryAuthenticationProvider implementing AuthenticationProvider:
+   - authenticate(Authentication auth) extracts email/password from the
+     incoming UsernamePasswordAuthenticationToken
+   - calls AuthApiClient.login(new LoginRequest(email, password))
+   - on success, builds a new UsernamePasswordAuthenticationToken whose
+     principal is an AuthenticatedUser (populated from the AuthResponse
+     — decode the JWT's role claim, or use AuthResponse.getRole() if
+     already present) and whose authorities is a single
+     SimpleGrantedAuthority("ROLE_" + role)
+   - on failure (Feign throws a 401/other error), throws
+     BadCredentialsException so Spring Security shows the standard
+     "invalid login" flow
+
+3. SecurityConfig (@Configuration, @EnableWebSecurity):
+   - Registers FoodDeliveryAuthenticationProvider
+   - authorizeHttpRequests:
+     permitAll: "/", "/login", "/register/**", "/restaurants/**",
+                "/css/**", "/error"
+     hasRole("CUSTOMER"): "/customer/**"
+     hasRole("RESTAURANT_OWNER"): "/restaurant-owner/**"
+     hasRole("DELIVERY_PARTNER"): "/delivery/**"
+     hasRole("ADMIN"): "/admin/**"
+     anyRequest authenticated
+   - formLogin: custom login page at "/login", usernameParameter="email",
+     defaultSuccessUrl handled by a custom AuthenticationSuccessHandler
+     (next bullet) since the post-login redirect depends on role
+   - logout: default logout at "/logout", invalidates the session
+   - CSRF stays enabled (default) — Thymeleaf's th:action forms pick up
+     the CSRF token automatically via thymeleaf-extras-springsecurity6,
+     no manual handling needed
+
+4. RoleBasedRedirectHandler implementing
+   AuthenticationSuccessHandler: redirects to /customer/dashboard,
+   /restaurant-owner/dashboard, /delivery/dashboard, or /admin/dashboard
+   based on the authenticated user's role.
+
+
+3. Shared Layout
+
+Prompt 3.1 — Layout fragments and styling
+
+In web-frontend, generate a shared Thymeleaf layout used by every page:
+
+1. templates/fragments/layout.html containing a reusable HTML skeleton
+   (head with a single stylesheet link, header, main content slot via
+   th:replace/th:insert, footer) — use Thymeleaf's layout dialect or
+   plain th:replace fragments, whichever needs no extra dependency
+   beyond what's already added.
+
+2. templates/fragments/nav.html: a navigation bar that uses
+   sec:authorize="hasRole('CUSTOMER')" etc. (from
+   thymeleaf-extras-springsecurity6) to show only the links relevant to
+   the logged-in user's role, plus a plain <form> logout button
+   (POST to /logout) when authenticated, and Login/Register links when
+   not. No dropdown menus, no collapsible mobile nav (both usually need
+   JS) — use a simple horizontal list of links that wraps naturally on
+   small screens via CSS flex-wrap.
+
+3. static/css/style.css: a clean, professional, mobile-responsive
+   stylesheet using plain CSS (Flexbox/Grid, media queries) — no
+   framework, no JS-dependent components. Define a simple, consistent
+   color palette (one primary color, one accent, neutral
+   grays/whites), consistent spacing scale, card-style containers for
+   restaurant/menu-item/order listings, and clear form styling
+   (labels, inputs, validation error text in a distinct color).
+
+Do not include Bootstrap, Tailwind's JS plugins, or any CDN <script>
+tag. Plain CSS only.
+
+Prompt 3.2 — Global error handling (no JS)
+
+In web-frontend, generate:
+
+1. A GlobalControllerAdvice (@ControllerAdvice) that catches
+   FeignException (from any backend call failing) and adds a generic
+   flash-friendly error model attribute, so any page can display
+   "Something went wrong, please try again" without a stack trace
+   leaking to the user.
+
+2. A custom error page (templates/error.html) for 404/500, styled with
+   the same layout/stylesheet as the rest of the app.
+
+3. A pattern for form re-display on validation failure: when a POST
+   fails Bean Validation, the controller returns the same template name
+   with the BindingResult in the model, and the template shows
+   th:errors next to each field — no redirect, no JS, just a re-rendered
+   page with the user's previously entered values preserved via
+   th:field binding.
+
+Use this exact pattern in every form controller generated in the
+sections below — state that explicitly so it stays consistent across
+all ~20 form-handling controllers in this app.
+
+
+4. Public Pages (no login required)
+
+Prompt 4.1 — Home, browse, registration, login
+
+In web-frontend, generate:
+
+1. HomeController: GET / -> a simple landing page (templates/home.html)
+   with a short description and links to Register/Login/Browse
+   Restaurants
+
+2. PublicRestaurantController (package com.fooddelivery.web.controller):
+   GET /restaurants?city=      -> calls RestaurantApiClient.search(city),
+                                    renders templates/restaurants/list.html
+                                    (card grid, each linking to detail)
+   GET /restaurants/{id}       -> calls RestaurantApiClient.getById +
+                                    MenuApiClient.getMenu, renders
+                                    templates/restaurants/detail.html
+                                    showing categories/items and a
+                                    "reviews" section
+                                    (ReviewApiClient.getForRestaurant)
+
+3. RegistrationController:
+   GET  /register            -> role selection page
+                                 (templates/auth/register-select.html):
+                                 links to /register/customer,
+                                 /register/restaurant-owner,
+                                 /register/delivery-partner (NOT admin —
+                                 admin accounts aren't self-service)
+   GET  /register/{role}     -> the actual registration form for that
+                                 role (templates/auth/register-form.html,
+                                 reused with a role parameter)
+   POST /register/{role}     -> calls AuthApiClient.register(...) with
+                                 the fixed role value baked in server-side
+                                 (never trust a hidden form field for
+                                 role); on success, redirect to /login
+                                 with a flash success message; on
+                                 validation failure, re-render the form
+                                 with errors per the pattern from
+                                 Prompt 3.2
+
+4. LoginController: GET /login -> templates/auth/login.html (a plain
+   email+password form posting to Spring Security's default
+   "/login" processing URL — no custom POST handler needed since
+   SecurityConfig's formLogin handles it)
+
+
+5. Customer Pages
+
+Prompt 5.1 — Profile completion + address management
+
+In web-frontend, generate a CustomerProfileController
+(package com.fooddelivery.web.controller.customer, all mapped under
+/customer/**, all requiring the authenticated user):
+
+GET  /customer/dashboard        -> if no customer profile exists yet
+                                    (CustomerApiClient.getMe() returns
+                                    404), redirect to
+                                    /customer/complete-profile; otherwise
+                                    show a simple dashboard linking to
+                                    Browse Restaurants, My Orders,
+                                    My Addresses, My Reviews
+GET  /customer/complete-profile -> form to create the profile
+POST /customer/complete-profile -> calls CustomerApiClient.create(...)
+                                    using the logged-in user's userId
+                                    from AuthenticatedUser, then redirect
+                                    to /customer/dashboard
+GET  /customer/addresses        -> list addresses
+GET  /customer/addresses/new    -> add-address form
+POST /customer/addresses/new    -> create address, redirect back to list
+GET  /customer/addresses/{id}/edit -> edit form
+POST /customer/addresses/{id}/edit -> update, redirect back to list
+POST /customer/addresses/{id}/delete -> delete, redirect back to list
+  (a plain form with a Delete button — no JS confirm dialog; if you want
+  a confirmation step, render a separate "Are you sure?" page instead)
+
+Use the form re-display-on-error pattern from Prompt 3.2 throughout.
+
+Prompt 5.2 — Cart and checkout
+
+In web-frontend, generate a CartController
+(package com.fooddelivery.web.controller.customer, under /customer/cart):
+
+GET  /customer/cart                    -> OrderApiClient.getCart(),
+                                            render templates/customer/cart.html
+                                            (item list, quantity update
+                                            forms, remove forms, subtotal,
+                                            a Checkout button)
+POST /customer/cart/items/{id}/update  -> quantity update form, redirect
+                                            back to /customer/cart
+POST /customer/cart/items/{id}/remove  -> remove form, redirect back
+GET  /customer/checkout                -> shows a delivery-address
+                                            picker (radio buttons from
+                                            CustomerApiClient.getAddresses())
+                                            and a payment method choice
+                                            (ONLINE/COD radio buttons)
+POST /customer/checkout                -> calls OrderApiClient.checkout(...),
+                                            redirect to
+                                            /customer/orders/{newOrderId}
+
+Also generate a small "add to cart" form embedded directly on the
+restaurant detail page (templates/restaurants/detail.html, extend the
+one from Prompt 4.1): each menu item has its own small POST form (item
+id as a hidden field, quantity as a number input) posting to
+POST /customer/cart/items -> calls OrderApiClient.addItem(...), redirects
+back to the same restaurant detail page. This requires the customer to
+be logged in — if not, redirect to /login first (Spring Security handles
+this automatically via the /customer/** role restriction).
+
+Prompt 5.3 — Orders, payment, reviews, notifications
+
+In web-frontend, generate:
+
+1. CustomerOrderController (/customer/orders):
+   GET /customer/orders          -> list own orders
+                                     (OrderApiClient.getMyOrders())
+   GET /customer/orders/{id}     -> order detail: items, status,
+                                     total, a "Pay Now" form if
+                                     paymentStatus is PENDING and
+                                     paymentMethod is ONLINE, and a
+                                     "Leave a Review" link if
+                                     orderStatus is DELIVERED and no
+                                     review exists yet for this order
+   POST /customer/orders/{id}/pay -> calls OrderApiClient.recordPayment
+                                      (simulated — a simple form with a
+                                      "Simulate Successful Payment"
+                                      button and a "Simulate Failed
+                                      Payment" button, each posting a
+                                      fixed status value), redirect back
+                                      to the order detail page
+
+2. CustomerReviewController (/customer/reviews):
+   GET  /customer/orders/{orderId}/review -> review form (rating radio
+                                              1-5, comment textarea)
+   POST /customer/orders/{orderId}/review -> calls
+                                              ReviewApiClient.submit(...),
+                                              redirect to order detail
+   GET  /customer/reviews                 -> list of the customer's
+                                              submitted reviews
+
+3. CustomerNotificationController (/customer/notifications):
+   GET /customer/notifications -> list notifications
+                                   (NotificationApiClient.getMine())
+
+
+6. Restaurant Owner Pages
+
+Prompt 6.1 — Profile, menu management, dashboard
+
+In web-frontend, generate a RestaurantOwnerController
+(package com.fooddelivery.web.controller.owner, under
+/restaurant-owner/**):
+
+GET  /restaurant-owner/dashboard        -> if no restaurant exists yet
+                                            for this owner (need a way
+                                            to check — if
+                                            RestaurantApiClient has no
+                                            "by owner" lookup, note this
+                                            gap and add a query param
+                                            or session-stored
+                                            restaurantId set right after
+                                            registration instead),
+                                            redirect to
+                                            /restaurant-owner/register;
+                                            otherwise show restaurant
+                                            status (approval_status,
+                                            is_open) and links to Menu
+                                            Management, Incoming Orders
+GET  /restaurant-owner/register         -> restaurant registration form
+POST /restaurant-owner/register         -> calls
+                                            RestaurantApiClient.register(...),
+                                            store the returned
+                                            restaurantId in the HTTP
+                                            session for this owner,
+                                            redirect to dashboard
+POST /restaurant-owner/toggle-open      -> calls
+                                            RestaurantApiClient.toggleOpen(...),
+                                            redirect back to dashboard
+
+Also generate a MenuManagementController
+(/restaurant-owner/menu):
+GET  /restaurant-owner/menu                    -> full menu view (reuse
+                                                    MenuApiClient.getMenu),
+                                                    with "Add Category"
+                                                    and "Add Item" links
+GET  /restaurant-owner/menu/categories/new     -> add-category form
+POST /restaurant-owner/menu/categories/new     -> create, redirect back
+GET  /restaurant-owner/menu/items/new          -> add-item form
+                                                   (category dropdown
+                                                   populated from
+                                                   existing categories)
+POST /restaurant-owner/menu/items/new          -> create, redirect back
+GET  /restaurant-owner/menu/items/{id}/edit    -> edit form (price,
+                                                    availability toggle,
+                                                    description)
+POST /restaurant-owner/menu/items/{id}/edit    -> update, redirect back
+POST /restaurant-owner/menu/items/{id}/delete  -> delete, redirect back
+
+Note the restaurantId gap explicitly in your response if
+RestaurantApiClient truly has no "get restaurant by owner" capability —
+propose the smallest fix (a query param on GET /api/restaurants filtered
+by ownerUserId, or reading it from the session set at registration time)
+rather than silently working around it.
+
+Prompt 6.2 — Incoming orders and delivery handoff
+
+In web-frontend, generate an OwnerOrderController
+(/restaurant-owner/orders):
+
+GET  /restaurant-owner/orders             -> list incoming orders for
+                                              this restaurant
+                                              (OrderApiClient.getOrders(),
+                                              filtered server-side by
+                                              this owner's restaurantId)
+GET  /restaurant-owner/orders/{id}        -> order detail with a status
+                                              update form (a dropdown of
+                                              valid next statuses only —
+                                              PLACED -> ACCEPTED ->
+                                              PREPARING ->
+                                              READY_FOR_PICKUP; render
+                                              only the one valid next
+                                              step as a button rather
+                                              than a free dropdown, to
+                                              avoid triggering a backend
+                                              validation error)
+POST /restaurant-owner/orders/{id}/status -> calls
+                                              OrderApiClient.updateStatus(...),
+                                              redirect back to detail
+POST /restaurant-owner/orders/{id}/dispatch -> visible only when
+                                              orderStatus is
+                                              READY_FOR_PICKUP; calls
+                                              DeliveryApiClient equivalent
+                                              endpoint (add
+                                              POST /api/deliveries to
+                                              DeliveryApiClient if not
+                                              already present from
+                                              Prompt 2.1) to create the
+                                              delivery record, redirect
+                                              back to detail
+
+
+7. Delivery Partner Pages
+
+Prompt 7.1 — Registration, availability, assigned deliveries
+
+In web-frontend, generate a DeliveryPartnerController
+(package com.fooddelivery.web.controller.delivery, under /delivery/**):
+
+GET  /delivery/dashboard          -> if no partner profile exists yet,
+                                      redirect to /delivery/register;
+                                      otherwise show current
+                                      availability_status with a toggle
+                                      form and a list of any active
+                                      deliveries
+GET  /delivery/register           -> partner registration form
+                                      (fullName, phone, vehicleType,
+                                      vehicleNumber)
+POST /delivery/register           -> calls
+                                      DeliveryApiClient.register(...),
+                                      store the returned partnerId in
+                                      the session, redirect to dashboard
+POST /delivery/availability       -> a simple form with three radio
+                                      buttons (AVAILABLE/BUSY/OFFLINE),
+                                      calls
+                                      DeliveryApiClient.updateAvailability(...),
+                                      redirect back to dashboard
+GET  /delivery/deliveries/{id}    -> delivery detail with a status
+                                      update form showing only the one
+                                      valid next action as a button
+                                      (ASSIGNED -> "Mark Picked Up",
+                                      PICKED_UP -> "Mark Delivered"),
+                                      same pattern as the restaurant
+                                      owner's order-status page
+POST /delivery/deliveries/{id}/status -> calls
+                                      DeliveryApiClient.updateStatus(...),
+                                      redirect back to detail
+
+
+8. Admin Pages
+
+Prompt 8.1 — Approvals, user management, audit log, settings
+
+In web-frontend, generate an AdminController
+(package com.fooddelivery.web.controller.admin, under /admin/**):
+
+GET  /admin/dashboard                          -> links to Pending
+                                                    Restaurants, Pending
+                                                    Delivery Partners,
+                                                    Audit Log, Settings
+GET  /admin/restaurants/pending                -> list, using the
+                                                    endpoint added in
+                                                    Prompt 0.2, each row
+                                                    with Approve/Reject
+                                                    forms
+POST /admin/restaurants/{id}/approve           -> calls
+                                                    AdminApiClient.approveRestaurant(id, "APPROVED")
+POST /admin/restaurants/{id}/reject            -> same, with "REJECTED"
+GET  /admin/delivery-partners/pending          -> same pattern as
+                                                    restaurants, using
+                                                    the endpoint from
+                                                    Prompt 0.2
+POST /admin/delivery-partners/{id}/approve     -> AdminApiClient call
+POST /admin/delivery-partners/{id}/reject      -> AdminApiClient call
+GET  /admin/users/{id}/manage                  -> a small page with
+                                                    Disable/Enable forms
+                                                    (accepts a userId
+                                                    typed/linked in —
+                                                    note that without a
+                                                    "list all users"
+                                                    backend endpoint,
+                                                    this page can only
+                                                    act on a known
+                                                    userId; flag this as
+                                                    a gap rather than
+                                                    inventing a user-list
+                                                    endpoint that doesn't
+                                                    exist)
+POST /admin/users/{id}/disable                 -> AdminApiClient call
+POST /admin/users/{id}/enable                  -> AdminApiClient call
+GET  /admin/audit-logs                         -> list, with optional
+                                                    entityType filter
+                                                    as a GET query param
+                                                    form (a simple
+                                                    dropdown + Filter
+                                                    button, no JS)
+GET  /admin/settings/{key}                     -> view/edit a single
+                                                    setting
+POST /admin/settings/{key}                     -> update, redirect back
+
+All redirect targets should use RedirectAttributes flash messages
+("Restaurant approved.", "User disabled.") shown at the top of the next
+rendered page via the shared layout from Prompt 3.1.
+
+
+Checklist before considering the frontend done
+
+
+ No <script> tag, no .js file, anywhere in the generated web-frontend module
+
+ Registering as each of the 3 self-service roles, then logging in, lands on the correct role-specific dashboard
+
+ A CUSTOMER session cannot reach /restaurant-owner/**, /delivery/**, or /admin/** (verify by typing the URL directly — Spring Security should redirect/403, not silently render)
+
+ Submitting an invalid form (e.g. empty required field) re-renders the same page with field-level error text and the user's other input preserved — no blank form, no stack trace
+
+ Adding an item from a second restaurant to the cart shows the backend's MultiRestaurantCartException message as a readable flash error, not a raw exception page
+
+ The full happy path works end-to-end through the UI only, no API tools: register → browse → add to cart → checkout → (as owner) accept/prepare/ready → dispatch → (as partner) pick up/deliver → (as customer) pay → review
+
+ Admin can approve a pending restaurant and it then appears in the public /restaurants listing
+
+
+This closes out the full-stack build. At this point you have a working, demonstrable system through a real browser UI — a good place to write the project README and record a short walkthrough if this is going in a portfolio.
+

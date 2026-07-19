@@ -1,0 +1,379 @@
+Day 3–4 Build Guide — Order Service
+
+Scope: Cart, Orders, and Payment tracking — the heaviest single service in this project (5 tables, the busiest set of Feign calls, the most business logic). Split across two days: Day 3 gets you to a working checkout; Day 4 adds payment recording, controllers, and tests.
+Companion docs: Database-Schema-Design.md Section 7, Day1-Copilot-Prompt-Sequence.md, Day2-Copilot-Prompt-Sequence.md
+
+
+
+0. Prerequisite — one small addition to Customer Service
+
+Order Service needs to validate that a delivery_address_id actually belongs to the customer placing the order. Day 2's Customer Service only exposed GET /internal/customers/{id} — add one more internal endpoint before starting Order Service.
+
+
+Prompt 0.1 — Extend Customer Service's internal controller
+
+In the existing customer-service module, add one more endpoint to
+InternalCustomerController:
+
+GET /internal/customers/{customerId}/addresses/{addressId}
+-> returns the AddressResponse if that address belongs to that customer,
+   otherwise throws ResourceNotFoundException (handled by the existing
+   GlobalExceptionHandler, resulting in a 404)
+
+Add the corresponding method to CustomerService:
+validateAndGetAddress(Long customerId, Long addressId)
+
+Do not change any other existing files in customer-service.
+
+
+PART 1 (Day 3) — Entities through Checkout
+
+Prompt 1.1 — Entities
+
+In the order-service module (Java 21, Spring Boot 3.2.x, Spring Data JPA,
+Lombok), generate JPA entities for exactly these five tables. Do not add
+any fields beyond what's listed.
+
+Table: carts
+- id: BIGSERIAL PK
+- customer_id: BIGINT NOT NULL UNIQUE (logical reference to Customer
+  Service customers.id — one cart per customer, reused across sessions)
+- restaurant_id: BIGINT, nullable (logical reference to Restaurant
+  Service restaurants.id; null when the cart is empty)
+- created_at: TIMESTAMP NOT NULL, auto-set on insert
+- updated_at: TIMESTAMP NOT NULL, auto-updated on every update
+
+Table: cart_items
+- id: BIGSERIAL PK
+- cart_id: BIGINT NOT NULL, FK to carts.id
+- menu_item_id: BIGINT NOT NULL (logical reference to Menu Service
+  menu_items.id)
+- item_name: VARCHAR(150) NOT NULL (snapshot at add-time)
+- unit_price: NUMERIC(10,2) NOT NULL (snapshot at add-time)
+- quantity: INT NOT NULL DEFAULT 1, must be > 0
+- created_at: TIMESTAMP NOT NULL, auto-set on insert
+- Unique constraint on (cart_id, menu_item_id)
+
+Table: orders
+- id: BIGSERIAL PK
+- customer_id: BIGINT NOT NULL
+- restaurant_id: BIGINT NOT NULL
+- delivery_address_id: BIGINT NOT NULL
+- order_status: VARCHAR(30) NOT NULL DEFAULT 'PLACED'
+  (values: PLACED, ACCEPTED, PREPARING, READY_FOR_PICKUP, PICKED_UP,
+  DELIVERED, CANCELLED)
+- subtotal: NUMERIC(10,2) NOT NULL
+- delivery_fee: NUMERIC(10,2) NOT NULL DEFAULT 0
+- total_amount: NUMERIC(10,2) NOT NULL
+- payment_method: VARCHAR(20) NOT NULL (values: ONLINE, COD)
+- payment_status: VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+  (values: PENDING, PAID, FAILED, REFUNDED)
+- placed_at: TIMESTAMP NOT NULL, auto-set on insert
+- updated_at: TIMESTAMP NOT NULL, auto-updated on every update
+
+Table: order_items
+- id: BIGSERIAL PK
+- order_id: BIGINT NOT NULL, FK to orders.id
+- menu_item_id: BIGINT NOT NULL
+- item_name: VARCHAR(150) NOT NULL (snapshot at order time)
+- unit_price: NUMERIC(10,2) NOT NULL (snapshot at order time)
+- quantity: INT NOT NULL, must be > 0
+- subtotal: NUMERIC(10,2) NOT NULL (unit_price * quantity)
+
+Table: payment_transactions
+- id: BIGSERIAL PK
+- order_id: BIGINT NOT NULL, FK to orders.id
+- transaction_ref: VARCHAR(100), nullable, unique (null for COD)
+- amount: NUMERIC(10,2) NOT NULL
+- status: VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+  (values: PENDING, PAID, FAILED, REFUNDED)
+- gateway_response: TEXT, nullable
+- created_at: TIMESTAMP NOT NULL, auto-set on insert
+
+Use package com.fooddelivery.orderservice.entity.
+Use @OneToMany (carts -> cart_items, orders -> order_items,
+orders -> payment_transactions) with cascade = ALL and
+orphanRemoval = true where the child is fully owned by the parent
+(cart_items and order_items; payment_transactions is append-only so
+cascade = PERSIST is enough, no orphanRemoval).
+Use @CreationTimestamp / @UpdateTimestamp for timestamp columns.
+
+Prompt 1.2 — Repositories and DTOs
+
+In order-service, generate:
+
+1. CartRepository with findByCustomerId(Long customerId)
+2. CartItemRepository with findByCartIdAndMenuItemId(Long cartId, Long menuItemId)
+3. OrderRepository with findByCustomerId(Long customerId) and
+   findByRestaurantId(Long restaurantId)
+4. OrderItemRepository (standard CRUD only)
+5. PaymentTransactionRepository with findByOrderId(Long orderId)
+
+DTOs in com.fooddelivery.orderservice.dto:
+- AddCartItemRequest (menuItemId, quantity — Bean Validation: quantity min 1)
+- UpdateCartItemRequest (quantity)
+- CartItemResponse (id, menuItemId, itemName, unitPrice, quantity, lineSubtotal)
+- CartResponse (id, restaurantId, items: List<CartItemResponse>, subtotal)
+- CheckoutRequest (deliveryAddressId, paymentMethod — Bean Validation:
+  paymentMethod must be ONLINE or COD)
+- OrderItemResponse (id, menuItemId, itemName, unitPrice, quantity, subtotal)
+- OrderResponse (id, customerId, restaurantId, deliveryAddressId,
+  orderStatus, subtotal, deliveryFee, totalAmount, paymentMethod,
+  paymentStatus, placedAt, items: List<OrderItemResponse>)
+- UpdateOrderStatusRequest (orderStatus)
+- PaymentResultRequest (transactionRef, status, gatewayResponse)
+
+A plain OrderMapper class (manual mapping, no MapStruct) covering
+cart/cartItem/order/orderItem entity <-> DTO conversions.
+
+Prompt 1.3 — Feign clients
+
+In order-service, generate three OpenFeign clients following the
+convention established in customer-service/restaurant-service/menu-service
+(package com.fooddelivery.orderservice.client, one subfolder per client):
+
+1. CustomerServiceClient (@FeignClient(name = "customer-service",
+   fallback = CustomerServiceFallback.class)):
+   GET /internal/customers/{customerId}/addresses/{addressId}
+   -> AddressSummaryResponse (id, customerId, addressLine1, city)
+
+2. RestaurantServiceClient (@FeignClient(name = "restaurant-service",
+   fallback = RestaurantServiceFallback.class)):
+   GET /internal/restaurants/{id}
+   -> RestaurantSummaryResponse (id, approvalStatus, isOpen)
+
+3. MenuServiceClient (@FeignClient(name = "menu-service",
+   fallback = MenuServiceFallback.class)):
+   GET /internal/items/{itemId}
+   -> MenuItemSummaryResponse (id, restaurantId, name, price, isAvailable)
+
+Each fallback class throws ServiceUnavailableException with a message
+naming which service is unreachable. Response DTOs go in each client's
+own dto subfolder, containing only the fields listed above.
+
+Add spring-cloud-starter-openfeign to pom.xml and @EnableFeignClients to
+the main application class. Also add the shared Feign timeout block to
+application.yml (same block used in customer/restaurant/menu-service).
+
+Prompt 1.4 — CartService
+
+In order-service, generate a CartService (com.fooddelivery.orderservice.service)
+with:
+
+- getOrCreateCart(Long customerId): finds the customer's existing cart row
+  or creates a new empty one (restaurant_id null)
+
+- addItemToCart(Long customerId, AddCartItemRequest request):
+  1. call MenuServiceClient.getMenuItem(request.getMenuItemId()); throw
+     ResourceNotFoundException if not found, throw
+     ItemUnavailableException if isAvailable is false
+  2. get or create the cart via getOrCreateCart
+  3. if cart.restaurantId is null, set it to the item's restaurantId
+  4. if cart.restaurantId is already set to a DIFFERENT restaurant, throw
+     a custom MultiRestaurantCartException ("Cart already contains items
+     from a different restaurant — clear your cart first")
+  5. if a cart_item for that menu_item_id already exists in this cart,
+     increment its quantity by request.getQuantity(); otherwise create a
+     new cart_item snapshotting item_name and unit_price from the Feign
+     response
+  6. return the updated CartResponse
+
+- updateCartItemQuantity(Long cartItemId, UpdateCartItemRequest request):
+  updates quantity, or deletes the row if the new quantity is 0
+
+- removeCartItem(Long cartItemId): deletes the cart_item; if the cart
+  becomes empty, reset cart.restaurantId to null
+
+- getCart(Long customerId): returns CartResponse with computed subtotal
+  (sum of unit_price * quantity across items)
+
+- clearCart(Long customerId): deletes all cart_items and resets
+  restaurant_id to null (used internally after a successful checkout)
+
+Prompt 1.5 — OrderService: checkout logic
+
+In order-service, generate an OrderService (com.fooddelivery.orderservice.service)
+with a checkout(Long customerId, CheckoutRequest request) method that:
+
+1. Loads the customer's cart via CartService; throws EmptyCartException
+   if it has no items
+2. Calls CustomerServiceClient.validateAddress(customerId,
+   request.getDeliveryAddressId()) to confirm the address belongs to this
+   customer; propagate ResourceNotFoundException if invalid
+3. Calls RestaurantServiceClient.getRestaurant(cart.getRestaurantId());
+   throws RestaurantClosedException if approvalStatus isn't APPROVED or
+   isOpen is false
+4. Computes subtotal as the sum of (unit_price * quantity) across all
+   cart_items
+5. Applies a flat delivery fee read from application.yml
+   (order.delivery-fee-flat, default 40.00) — do not hardcode the value
+   in the service class
+6. Computes total_amount = subtotal + delivery_fee
+7. Creates the Order row (order_status = PLACED, payment_status = PENDING),
+   and creates one OrderItem per cart_item, copying item_name/unit_price/
+   quantity and computing each line's subtotal
+8. If payment_method is ONLINE, creates a PaymentTransaction row
+   (status = PENDING, transaction_ref = null, amount = total_amount)
+9. Calls CartService.clearCart(customerId) to empty the cart for next time
+10. Returns the created OrderResponse
+
+Wrap steps 4-9 in a single @Transactional method so a failure partway
+through rolls back cleanly (no half-created order).
+
+
+PART 2 (Day 4) — Payment, Controllers, Tests
+
+Prompt 2.1 — PaymentService (simulated payment tracking)
+
+In order-service, generate a PaymentService (com.fooddelivery.orderservice.service)
+with:
+
+- recordPaymentResult(Long orderId, PaymentResultRequest request):
+  1. loads the order; throws ResourceNotFoundException if missing
+  2. throws InvalidPaymentMethodException if the order's payment_method
+     isn't ONLINE (COD orders don't go through this flow)
+  3. finds the order's existing PENDING payment_transactions row (or
+     creates one if somehow missing) and updates its status,
+     transaction_ref, and gateway_response from the request
+  4. updates the order's payment_status to match (PAID or FAILED)
+  5. returns the updated OrderResponse
+
+This method simulates a payment gateway callback — it does not call any
+real external payment provider. Document that clearly in a Javadoc
+comment on the method.
+
+- getPaymentHistory(Long orderId): returns all payment_transactions rows
+  for an order (List<PaymentTransactionResponse> — add this DTO with
+  id, transactionRef, amount, status, createdAt)
+
+Prompt 2.2 — Order status update logic
+
+In order-service, add to OrderService:
+
+- updateOrderStatus(Long orderId, UpdateOrderStatusRequest request):
+  validates the requested order_status is one of the 7 valid values,
+  rejects the update with InvalidOrderStatusTransitionException if the
+  requested status would move backwards in this sequence: PLACED ->
+  ACCEPTED -> PREPARING -> READY_FOR_PICKUP -> PICKED_UP -> DELIVERED
+  (CANCELLED is allowed from any status except DELIVERED), otherwise
+  updates order_status and returns the updated OrderResponse
+
+- getOrderById(Long orderId): throws ResourceNotFoundException if missing
+
+- getOrdersForCustomer(Long customerId)
+
+- getOrdersForRestaurant(Long restaurantId)
+
+- getOrderForInternalUse(Long orderId): returns OrderResponse for
+  internal Feign consumption by Delivery Service and Review Service
+
+Prompt 2.3 — Controllers
+
+In order-service, generate three controllers:
+
+1. CartController (public API), package
+   com.fooddelivery.orderservice.controller:
+   POST   /api/cart/items            -> addItemToCart
+   GET    /api/cart                  -> getCart
+   PUT    /api/cart/items/{id}       -> updateCartItemQuantity
+   DELETE /api/cart/items/{id}       -> removeCartItem
+   (customerId comes from an X-User-Id header, same convention as
+   customer-service's controller)
+
+2. OrderController (public API):
+   POST /api/cart/checkout           -> checkout
+   GET  /api/orders/{id}             -> getOrderById
+   GET  /api/orders                  -> getOrdersForCustomer or
+                                         getOrdersForRestaurant depending
+                                         on an X-User-Role header
+                                         (CUSTOMER vs RESTAURANT_OWNER)
+   PUT  /api/orders/{id}/status      -> updateOrderStatus
+   POST /api/orders/{id}/payment     -> recordPaymentResult
+   GET  /api/orders/{id}/payments    -> getPaymentHistory
+
+3. InternalOrderController:
+   GET /internal/orders/{id} -> getOrderForInternalUse, for Delivery
+   Service and Review Service Feign calls
+
+Use @Valid on request bodies, ResponseEntity<T> return types.
+
+Prompt 2.4 — Global exception handling
+
+In order-service, generate a GlobalExceptionHandler
+(@RestControllerAdvice) in com.fooddelivery.orderservice.exception, using
+the same response shape as auth-service's handler (paste it as
+reference), handling:
+- ResourceNotFoundException -> 404
+- EmptyCartException -> 400
+- ItemUnavailableException -> 400
+- MultiRestaurantCartException -> 409
+- RestaurantClosedException -> 400
+- InvalidPaymentMethodException -> 400
+- InvalidOrderStatusTransitionException -> 409
+- ServiceUnavailableException -> 503
+- MethodArgumentNotValidException -> 400 with field error map
+- Exception (catch-all) -> 500
+
+Prompt 2.5 — application.yml + Swagger
+
+In order-service, generate application.yml that:
+- Sets spring.application.name to "order-service"
+- Pulls config from Config Server, registers with Eureka
+- Runs on port 8085
+- Configures PostgreSQL datasource for order_service_db
+- Sets spring.jpa.hibernate.ddl-auto to "validate"
+- Includes the shared Feign timeout block
+- Adds order.delivery-fee-flat: 40.00 as a configurable property
+
+Add springdoc-openapi-starter-webmvc-ui to pom.xml.
+
+Prompt 2.6 — Unit tests
+
+In order-service, generate JUnit 5 + Mockito tests covering:
+
+CartService:
+- addItemToCart() throws ItemUnavailableException when the menu item
+  isn't available
+- addItemToCart() throws MultiRestaurantCartException when adding an
+  item from a different restaurant than what's already in the cart
+- addItemToCart() increments quantity instead of duplicating a row when
+  the same item is added twice
+
+OrderService:
+- checkout() throws EmptyCartException for an empty cart
+- checkout() throws RestaurantClosedException when the restaurant isn't
+  APPROVED/open
+- checkout() correctly computes subtotal, delivery_fee, and total_amount
+- checkout() creates a PENDING payment_transactions row only when
+  payment_method is ONLINE, not for COD
+- checkout() clears the cart after a successful order
+- updateOrderStatus() throws InvalidOrderStatusTransitionException when
+  moving backwards (e.g. DELIVERED -> PREPARING)
+
+PaymentService:
+- recordPaymentResult() throws InvalidPaymentMethodException for a COD order
+- recordPaymentResult() updates both the payment_transactions row and
+  the order's payment_status together
+
+Mock all repositories and all three Feign clients
+(CustomerServiceClient, RestaurantServiceClient, MenuServiceClient).
+
+
+Checklist before moving to Day 5 (Delivery, Notification)
+
+
+ Adding an item from restaurant A, then trying to add an item from restaurant B, is rejected with a clear error
+
+ Checkout against a PENDING-approval restaurant is rejected; works once APPROVED and isOpen = true
+
+ A COD checkout produces payment_status = PENDING with no payment_transactions row; an ONLINE checkout produces one PENDING row
+
+ POST /api/orders/{id}/payment with status = PAID updates both the transaction and the parent order
+
+ order_status cannot be moved backwards through the update endpoint
+
+ GET /internal/orders/{id} works directly (not through the Gateway) — Delivery Service will Feign-call this on Day 5 to create a delivery record with the right addresses/restaurant
+
+
+Day 5 (Delivery Service) will be the next consumer of GET /internal/orders/{id}, and will introduce the first bidirectional relationship in the system: Delivery Service reads from Order Service, and Order Service's order_status needs to move to PICKED_UP/DELIVERED in step with the delivery record — worth deciding now whether that's a Feign call from Delivery back into Order, or a status update triggered by the client hitting both APIs. We can plan that explicitly at the start of the Day 5 guide.
+

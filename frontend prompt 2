@@ -1,0 +1,77 @@
+Create a new Spring Boot module called `frontend-service` that serves as a server-rendered
+web UI for an Online Food Delivery System. This service has NO REST API of its own — it is
+a pure MVC frontend that calls the backend microservices exclusively through the API Gateway
+(api-gateway) using RestTemplate or WebClient (blocking mode).
+
+STRICT CONSTRAINTS:
+- Thymeleaf + HTML + CSS only. NO JavaScript, NO JS frameworks, NO fetch/AJAX, NO <script> tags.
+- All interactivity (forms, navigation, filters, pagination) must work via standard HTML forms
+  (GET/POST) and full page reloads — no client-side scripting of any kind.
+- Authentication: user logs in via a login form; frontend-service calls auth-service (through
+  the gateway) to get a JWT, then stores the JWT server-side in the HttpSession (never in a
+  cookie or localStorage, never exposed to the browser). Every backend call attaches this JWT
+  as a Bearer token via an Authorization header, added server-side.
+- Use Spring Security only for session management / access control on frontend-service routes
+  (not for issuing tokens — that's auth-service's job). Protect routes by role using role stored
+  in the session.
+
+TECH STACK:
+- Java 21, Spring Boot 3, Maven
+- Spring Web (MVC), Thymeleaf, Spring Security (session-based, form login flow)
+- RestTemplate (or WebClient in blocking .block() mode) for calling the gateway
+- Lombok, SLF4J for logging
+- No database — this service is stateless except for the HTTP session
+
+ROLES & PAGES (build one controller + templates per role):
+1. GUEST (unauthenticated): landing page, browse restaurants/menus (read-only), login, register
+2. CUSTOMER: browse restaurants, view menu, add to cart (via POST forms, cart held in session),
+   checkout/place order, view order history, view order status, leave review
+3. RESTAURANT OWNER: manage own restaurant profile, manage menu items (CRUD via forms), view
+   incoming orders, update order status
+4. DELIVERY PERSON: view assigned deliveries, update delivery status
+5. ADMIN: list/manage customers, restaurants, orders; basic dashboard with summary stats
+
+PROJECT STRUCTURE:
+- src/main/java/.../frontend/config       -> SecurityConfig, RestTemplateConfig, WebClient/Gateway base URL config
+- src/main/java/.../frontend/controller    -> one controller per role/domain (AuthController,
+  CustomerController, RestaurantOwnerController, DeliveryController, AdminController)
+- src/main/java/.../frontend/dto           -> plain DTOs mirroring backend API request/response shapes
+- src/main/java/.../frontend/client        -> thin client classes per backend service
+  (AuthServiceClient, RestaurantServiceClient, OrderServiceClient, etc.), each wrapping
+  RestTemplate calls to the gateway with the JWT header attached
+- src/main/java/.../frontend/session       -> helper for storing/retrieving JWT + user role/id
+  from HttpSession
+- src/main/resources/templates             -> Thymeleaf templates, organized in subfolders per
+  role (templates/customer/, templates/restaurant/, templates/delivery/, templates/admin/,
+  templates/auth/), plus a shared templates/layout/ with a Thymeleaf fragment for header/nav/footer
+- src/main/resources/static/css            -> hand-written CSS (no CSS framework unless I ask
+  for Bootstrap explicitly), organized as base.css + one file per section if needed
+
+DESIGN / VISUAL REQUIREMENTS:
+- Clean, professional, modern look — NOT a default-Bootstrap or toy/childish appearance.
+- Consistent design system: define CSS custom properties (variables) for a small color palette
+  (e.g. one primary brand color, a neutral gray scale, one accent/success/danger color), spacing
+  scale, and a clean sans-serif font stack.
+- Use a shared layout fragment (header with logo/nav based on role, footer) included via
+  Thymeleaf th:replace/th:insert across all pages so styling stays consistent.
+- Card-based layouts for restaurant/menu listings, clean tables for order/admin lists, clear
+  visual hierarchy (headings, whitespace, subtle borders/shadows rather than heavy colors).
+- Responsive basics (flexbox/grid, no fixed pixel-locked layouts) but desktop-first is fine.
+- Every form should have proper labels, validation error display (from Spring's BindingResult),
+  and clear primary/secondary button styling — all still purely HTML/CSS, no JS validation.
+
+INTEGRATION DETAILS:
+- API Gateway base URL should be externalized via application.yml (e.g. gateway.base-url).
+- Each *ServiceClient class should have clear methods per endpoint (e.g.
+  RestaurantServiceClient.getAllRestaurants(), .getMenuByRestaurantId(id)), returning DTOs,
+  and should throw/handle errors so controllers can show a friendly error page/flash message
+  on failure (e.g. backend down, 401/403, validation errors from backend).
+- Use Spring's flash attributes (RedirectAttributes) for post-redirect-get success/error
+  messages, since there's no JS for toasts/alerts.
+
+Please scaffold this step by step:
+1. First give me the Maven pom.xml and application.yml.
+2. Then SecurityConfig + session/JWT helper classes.
+3. Then the shared layout fragment + base.css design system.
+4. Then one role's full vertical slice (controller + client + templates) at a time, starting
+   with Auth (login/register) and then Customer, so I can review each before moving on.
